@@ -173,10 +173,74 @@ def model_subcall():
     return {"pool_caller_reachable": False}
 
 
+# ---------------------------------------------------------------------------
+# 5. EarnManager (privana-services @2de4a559): vault share math
+#    EarnManager.sol:59-60 (VIRTUAL_SHARES/ASSETS), :389 (deposit floor),
+#    :446-448 (withdraw ceil), :264 (syncTotalAssets, onlyPoolAdmin),
+#    :375-377 (seed gate), :382 (transferBalance binds to=pool + nonce)
+# ---------------------------------------------------------------------------
+VIRTUAL_SHARES = 1_000_000
+VIRTUAL_ASSETS = 1
+
+
+def earn_deposit(total_shares: int, total_assets: int, amount: int):
+    shares = amount * (total_shares + VIRTUAL_SHARES) // (total_assets + VIRTUAL_ASSETS)
+    return total_shares + shares, total_assets + amount, shares
+
+
+def earn_withdraw(total_shares: int, total_assets: int, amount: int):
+    # ceil: sharesToBurn = ceil(amount * (S + VS) / (A + VA))
+    num = amount * (total_shares + VIRTUAL_SHARES)
+    den = total_assets + VIRTUAL_ASSETS
+    shares = (num + den - 1) // den
+    return total_shares - shares, total_assets - amount, shares
+
+
+def model_earn_shares():
+    # (a) depositing then redeeming everything is never profitable (floor on
+    #     deposit + ceil on withdraw both favour the pool).
+    worst_profit = 0
+    for total_shares, total_assets, x in [
+        (0, 0, 1), (0, 0, 10**18), (1, 1, 10**9), (10**6, 10**18, 10**12),
+        (3 * 10**18, 7 * 10**18, 10**15), (1, 10**19, 1),
+    ]:
+        s1, a1, shares = earn_deposit(total_shares, total_assets, x)
+        if shares == 0:
+            continue  # 1-wei deposit that mints nothing is a donation to the pool
+        assets_out = shares * (a1 + VIRTUAL_ASSETS) // (s1 + VIRTUAL_SHARES)
+        worst_profit = max(worst_profit, assets_out - x)
+    assert worst_profit <= 0, worst_profit
+
+    # (b) first-depositor / donation attack: with a pre-seeded `totalAssets`
+    #     and zero shares (the worst state the contract can be in), the
+    #     virtual offset caps the attacker's claim on the seed at dust.
+    worst_claim = 0
+    for seed in (1, 10**3, 10**6, 10**9, 10**12):
+        for victim in (10, 10**6, 10**12, 10**15):
+            s0, a0, s_att = earn_deposit(0, seed, 1)          # attacker: 1 wei
+            s1, a1, s_vic = earn_deposit(s0, a0, victim)      # victim
+            claim = s_att * (a1 + VIRTUAL_ASSETS) // (s1 + VIRTUAL_SHARES)
+            worst_claim = max(worst_claim, claim)
+    assert worst_claim <= 4, worst_claim  # wei, not a fraction of the seed
+
+    # (c) no permissionless way to raise totalAssets without minting shares:
+    #     the only writers are deposit() (mints) and syncTotalAssets (onlyPoolAdmin)
+    writers = ("deposit", "syncTotalAssets(onlyPoolAdmin)")
+    # (d) N1: the depositor's signature binds (to=pool, tokenId, amount, nonce)
+    #     but not `toUser`, so shares follow the *caller's* argument.
+    return {
+        "roundtrip_max_profit_wei": worst_profit,
+        "inflation_max_claim_wei": worst_claim,
+        "total_assets_writers": writers,
+        "deposit_to_user_bound_by_signature": False,
+    }
+
+
 if __name__ == "__main__":
     print("1 consensus bridge     :", model_consensus_bridge())
     print("2 roflmarket escrow    :", model_roflmarket_claims(10_000, 0, 3600,
                                                               [600, 600, 1200, 5000]))
     print("3 privana block-delta  :", model_privana_block_delta())
-    print("4 subcall caller        :", model_subcall())
+    print("4 subcall caller       :", model_subcall())
+    print("5 earn vault shares    :", model_earn_shares())
     print("all conservation properties hold")

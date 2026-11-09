@@ -11,9 +11,15 @@ contrato, DeFi/escrow construido por la fundación) · **Rama:** `arena/6cd095d1
 
 No encontré ninguna ruta en la que un atacante **sin rol privilegiado**, partiendo del estado
 desplegado, termine con más valor del que puso a costa de inventario ajeno. Cada hipótesis de
-drenaje que construí murió contra un hecho concreto del código anclado (tabla §4, con `archivo:línea`
-y el hecho que la mata). Los modelos de conservación reproducibles están en
-`audit/poc/conservation_models.py` (offline, exit 0 = no se crea ni se duplica valor).
+drenaje que construí murió contra un hecho concreto del código anclado (tabla §4 y ronda 2 en §4b,
+con `archivo:línea` y el hecho que la mata). Los modelos de conservación reproducibles están en
+`audit/poc/conservation_models.py` (offline, 5 modelos, exit 0 = no se crea ni se duplica valor).
+
+Segunda ronda (misma fecha) sobre superficie que faltaba — `EarnManager`/`SwapManager` live,
+API/onramp/webhooks de Privana, adaptador Hashi del ROFL Header Oracle y **deriva de versiones**
+del SDK (`v0.17.0` pineado vs `v0.17.1` vs `main`): **8 hipótesis nuevas, 8 refutadas**; cero fixes
+de seguridad publicados que el binario live no tenga. Lo único accionable es *hardening* (N1, §5).
+
 
 **Dos límites duros que impiden declarar cobertura completa** (y por tanto impiden un "no crítico"
 en sentido absoluto):
@@ -58,6 +64,8 @@ en sentido absoluto):
 | Consentimiento/nodo | `oasis-core` `master` = `3c3958f76fa1619e006a0e4d79e718aa93ad41b2` (release más reciente `v26.4`) |
 | Privana (DeFi/accounting, mainnet) | `privana` **`privana/v2.1.3`** = `c4c1d7b4d9d2fbdff9cc1909b22216909b10d421` |
 | Gateway JSON-RPC | `oasis-web3-gateway` HEAD `8107e81b4d5e8dc7638c1399599dc6527cb7d655` |
+| Privana DeFi services (Swap/Earn, live en Sapphire) | `privana-services` `master` = `2de4a559d692286f4db2bb77016f5e9e85672931` (2026‑11‑06) — `solidity/contracts/{SwapManager,EarnManager}.sol` |
+| ROFL Header Oracle (adaptador Hashi) | `rofl-header-oracle` `master` = `1d1f14e2011fbf9b5670a0decf10a9a396ce9d33` — `contracts/contracts/hashi/adapters/Oasis/ROFLAdapter.sol` |
 | EVs/Fork VM | `evm` `v0.39.1-oasis` = `13a30bfc1a10074f3f1676988aeb6ada76c65553` |
 
 ### 1.4 Mapa artefacto desplegado → repo / commit
@@ -116,6 +124,44 @@ Los cuatro a la vez: bug concreto en código que corre live · permissionless ·
 
 ---
 
+## 4b. Ronda 2 (2026‑11‑08): superficie nueva + deriva de versiones
+
+Se amplió la revisión a dos repos del ecosistema que no estaban en la primera pasada
+(`privana-services` = SwapManager/EarnManager live en Sapphire; `rofl-header-oracle` = adaptador
+Hashi sobre ROFL) y al **diff de versiones** del SDK (¿existe un fix de seguridad publicado que el
+binario live no tenga?). Nuevas hipótesis, todas refutadas:
+
+| # | Hipótesis (dónde) | Hecho que la mata |
+|---|---|---|
+| H14 | **EarnManager**: inflación del primer depositante / donación (`privana-services@2de4a559`, `EarnManager.sol:59‑60,389`) | `totalAssets` sólo cambia por `deposit` (`+= amount`, y el depositante recibe shares) o `syncTotalAssets` (onlyPoolAdmin): **no hay donación permissionless** que infle `A`. Y el offset virtual (`VIRTUAL_SHARES=1e6`, `VIRTUAL_ASSETS=1`) con `deposit` redondeando **abajo** (`:389`) y `withdraw` **arriba** (`:446‑448`) hace el round‑trip siempre lossy para el atacante (**modelo 5**: profit máx. 0 wei, claim máx. sobre el seed 1 wei en todo el grid) |
+| H15 | **EarnManager.deposit** acuña shares a un `toUser` **no** ligado a la firma (`:382‑392`) | La firma del depositante es `Transfer(toAddress=pool.poolAddress, tokenId, amount, nonce)` y sí liga destino y nonce (`EIP712SignatureVerifier.sol:146‑149,284‑287`); lo no ligado es sólo *quién recibe las shares*. Explotarlo exige **poseer la firma del depositante**, que en Sapphire viaja cifrada (envelope Deoxys‑II) ⇒ no permissionless. Queda como hardening (N1) |
+| H16 | **EarnManager.withdraw** salida sin co‑firma / replay (`:419‑457`) | Exige dos firmas: el consentimiento `Withdraw(poolId,amount,nonce)` del usuario (signer recuperado, se queman **sus** shares, nonce por usuario `:439‑440`) **y** la `Transfer` firmada por la pool (la custodia el servicio, no el llamante). Un relay no puede sacar fondos ajenos ni sin la pool |
+| H17 | **SwapManager.swap** redirección de la pata de salida / robo de la de entrada (`SwapManager.sol:46‑78`) | La salida es `transferBalance(user,…)` con la firma del LP sobre `toAddress=user` (ligado); la entrada es una `Transfer` del propio usuario al `liquidityProvider`. Las dos patas no son atómicas: el riesgo es que el servicio no pague la salida = **confianza/custodia**, no drenaje permissionless |
+| H18 | **API HTTP de Privana** (`/earn/deposit|withdraw`, `/swap`; webhooks `/onramp/*/webhook` en `privana`) acredita sin pago | Los webhooks se verifican con firma HMAC del proveedor y son **log‑only** ("non‑authoritative observability signals", `privana:src/api/routes.py:1022‑1088`); y los endpoints de `privana-services:src/api/{earn.py:178,swap.py:46}` sólo **encolan** la orden; todo movimiento de valor acaba en las firmas on‑chain de H15‑H17 ⇒ una petición forjada no acredita nada |
+| H19 | **Oráculo de firma en el TEE**: hacer que firme un tx arbitrario (`generateGasFundingTx`, `generateSweep*`) y drenar el gas tank | Las tres son `view` + `onlyROFLQuery` (msg.sender = `roflSignerAddress`) y el TEE construye **todos** los argumentos internamente (`accounting_contract.py:748‑807`); no hay endpoint que pase calldata del usuario a esas vistas |
+| H20 | **ROFLAdapter (Hashi)** forja hashes de bloque y drena el puente (`rofl-header-oracle@1d1f14e2`, `ROFLAdapter.sol:33,38,55`) | `storeBlockHeader(s)` exige `msg.sender == chainReporters[chainId]`, y los reporters sólo se fijan con `onlyROFL` (`:95`). `proveAncestralBlockHashes` **sí** es permissionless (`BlockHashAdapter.sol:15`) pero autoverificante: exige `keccak256(header) == hash almacenado` y sólo escribe el `parentHash` autenticado (`:28`) ⇒ no se puede elegir el valor. Forjar exige la clave del reporter o el origen de la app = privilegiado |
+| H21 | **Deriva de versiones**: ¿el binario live carece de un fix ya publicado? | `runtime-sdk/v0.17.0` (pineado) → `v0.17.1`: 8 commits, sólo wasm3‑rs 0.3.4 y toolchain/imagen (módulo `contracts`, que Sapphire **no** incluye). `v0.17.0` → `main` en módulos de dinero: lints, bumps de deps, `MAX_METADATA_PAIRS`; ningún fix de seguridad. `sapphire-paratime v1.3.0` → `main`: `MAX_CHECK_NONCE_FUTURE_DELTA`, `max_batch_gas`, keymanager 0.7.1 y contratos nuevos (no desplegados). **No hay parche pendiente que el live necesite** |
+
+Comprobaciones puntuales adicionales (todas negativas):
+
+- **Redondeo de undelegación** (`consensus_accounts/mod.rs:969‑975`): `shares * total_amount /
+  total_shares` **trunca** y `take_undelegation` consume la cola ⇒ Σ acuñado ≤ liberado por consenso;
+  el polvo queda sin acuñar (pérdida de dust para el usuario, nunca inflación).
+- **Stake de provider / app**: el record se borra **antes** de transferir (`rofl-market/src/lib.rs:296‑334`,
+  `rofl/mod.rs:363‑371`) y `ProviderUpdate` no toca `stake`; `ProviderRemove` exige
+  `instances_count == 0` ⇒ un solo reembolso, imposible retirar stake dos veces.
+- **Rewards** (`rewards/mod.rs:184`): paga desde `ADDRESS_REWARD_POOL` a `good_compute_entities()` del
+  round result (comité) ⇒ ni permissionless ni acuña.
+- **Origen ROFL** (`rofl/mod.rs:125‑128`): `get_origin_app()` = `state::get_endorser(tx_caller_public_key)`,
+  es decir hay que ser endorser (RK/RAK Ed25519) registrado del app; las claves se serializan con su
+  tipo ⇒ sin colisión secp256k1↔Ed25519 y sin suplantar `onlyROFL`.
+- **Gas funding de Privana**: `GAS_FUNDING_AMOUNT_WEI` (0.02 ROSE en testnet) < `MIN_DEPOSIT` (0.05) y
+  `__post_init__` exige `funding ≥ 65k · floor · 2` ⇒ aun inflando `baseFee`/gas price el depósito
+  sigue siendo barrible; si no lo fuera, los fondos quedan en la deposit address (la clave la tiene el
+  wallet encumbered, no el atacante) ⇒ griefing no monetizable.
+
+---
+
 ## 5. Observaciones NO críticas (no cumplen los 4 criterios)
 
 - **Privana `AuthToken`**: `Sapphire.encrypt/decrypt(_authTokenEncKey, nonce = 0, …)` reutiliza
@@ -129,6 +175,18 @@ Los cuatro a la vez: bug concreto en código que corre live · permissionless ·
   no como hallazgo.
 - **`_decodeReceiptDelegate`** usa offsets mágicos (`result[1]==0x66`, parse desde 8) en
   `Subcall.sol`: fragilidad de parser, sin movimiento de valor.
+- **N1 — `EarnManager.deposit` no liga `toUser`** (`privana-services@2de4a559`,
+  `EarnManager.sol:382‑392`): la firma autentica *la transferencia* (importe, token, destino = pool,
+  nonce) pero no *quién recibe las shares*; quien posea esa firma puede mintearlas a otra cuenta.
+  No es crítico porque en Sapphire la firma sólo existe dentro del calldata cifrado (envelope
+  Deoxys‑II) y no se emite en eventos; se convierte en robo real si un relayer/servicio la filtra o
+  si el contrato se despliega en una cadena con calldata pública. Fix: incluir `toUser` en el
+  typed‑data del depósito (p. ej. `Deposit(bytes32 poolId,address toUser,uint256 amount,uint256 nonce)`)
+  firmado por el usuario, igual que ya hace `Withdraw`.
+- **N2 — `SwapManager.swap` no es atómico respecto de la intención del usuario**: la pata de entrada
+  (usuario → LP) y la de salida (LP → usuario) son firmas independientes; un fallo entre ambas deja el
+  input en el LP y depende de que el servicio haga el refund (`refund:redeposit` en la máquina de
+  estados). Es riesgo de custodia/confianza, no vector permissionless.
 
 ---
 
@@ -139,10 +197,18 @@ Los cuatro a la vez: bug concreto en código que corre live · permissionless ·
   (`modules/accounts`, `consensus`, `consensus_accounts`, `evm` + precompiles `subcall`/`confidential`/
   `standard`/`erc20`, `rofl`, `rofl-market`); librería de contratos (`WrappedROSE`, `Subcall`,
   `Sapphire`, `Sapphire.sol` auth `SiweAuth`/`A13e`, OPL `Endpoint`); Privana mainnet (Accounting,
-  EVM signer, EIP-712 verifier, SIWE auth, pipeline de depósitos/sweep en el TEE).
+  EVM signer, EIP‑712 verifier, SIWE auth, pipeline de depósitos/sweep/gas‑tank/withdrawals en el TEE);
+  **ronda 2:** `privana-services` (SwapManager, EarnManager, API de earn/swap/onramp y webhooks) y
+  `rofl-header-oracle` (ROFLAdapter + `BlockHashAdapter.proveAncestralBlockHashes`), más el diff de
+  versiones `v0.17.0 → v0.17.1 → main` del SDK y `v1.3.0 → main` de `sapphire-paratime`.
 - **Clonado y fijado, revisión no exhaustiva:** `oasis-core` (consenso, staking/slashing, roothash,
   p2p, keymanager policy, rofl-node), `oasis-web3-gateway`, `cometbft`/`evm` (forks), `nexus`
-  (además LFS no descargado), `opengsn` (fork archivado).
+  (además LFS no descargado), `opengsn` (fork archivado), resto del ecosistema Privana
+  (`privana-services` más allá de los contratos y la API, `rofl-header-oracle` lado Python).
+- **Fuera del criterio (no es código de la fundación ni custodia de la fundación):** el lado LiFi/Base
+  del swap (`LiFi` como target externo con allowance del LP), Aave/Base, y el despliegue concreto de
+  un puente Hashi en Sapphire (el adaptador revisado es de terceros y sólo es alcanzable con la clave
+  del reporter o el origen del app).
 - **No reproducible aquí:** build SGX ORC y fork test contra mainnet (sin egress / sin `cargo`).
   El PoC incluido es analítico (modelos de conservación), no un test de fork.
 
@@ -150,6 +216,18 @@ Los cuatro a la vez: bug concreto en código que corre live · permissionless ·
 
 ```bash
 git clone https://github.com/oasisprotocol/sapphire-paratime && cd sapphire-paratime
-python3 audit/poc/conservation_models.py     # exit 0 = propiedades de conservación
+python3 audit/poc/conservation_models.py     # 5 modelos, exit 0 = propiedades de conservación
 column -t -s$'\t' audit/foundation-repos.tsv # 106 repos, HEAD exacto, ramas, tags
+```
+
+Ronda 2 (repos no fundacionales, fijados por commit):
+
+```bash
+git clone https://github.com/privana/privana-services   && git -C privana-services   checkout 2de4a559
+git clone https://github.com/privana/rofl-header-oracle && git -C rofl-header-oracle checkout 1d1f14e2
+# H14-H17: EarnManager.sol:59-60,382-392,446-456 / SwapManager.sol:52-78
+# H18: privana:src/api/routes.py:1022-1088 (webhooks HMAC, log-only)
+#      privana-services:src/api/{earn.py:178,swap.py:46} (sólo encolan)
+# H20: hashi/adapters/Oasis/ROFLAdapter.sol:33,38,55,95 / hashi/adapters/BlockHashAdapter.sol:15,28
+git -C oasis-sdk log --oneline runtime-sdk/v0.17.0..runtime-sdk/v0.17.1   # H21: 8 commits, sin fixes
 ```
